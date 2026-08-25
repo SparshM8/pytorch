@@ -894,7 +894,7 @@ class TestNVUniversalGemmHeuristics(TestCase):
         custom_secondary = dataclasses.replace(
             secondary, secondary_consumer_fn="generated_consumer"
         )
-        self.assertFalse(GemmVariant.GEMM.supports_reduction(custom_secondary))
+        self.assertTrue(GemmVariant.GEMM.supports_reduction(custom_secondary))
         self.assertTrue(
             GemmVariant.GEMM.supports_reduction(
                 dataclasses.replace(custom_secondary, feeds_main=True)
