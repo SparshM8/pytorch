@@ -2,7 +2,7 @@
 
 import contextlib
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import torch
 from torch._dynamo.utils import counters
@@ -285,39 +285,56 @@ class TestBenchmarker(TestCase):
         self.assertEqual(result, 5.0)
         self.assertEqual(calls, [{"grad_to_none": None, "estimation_iters": 2}])
 
-    def test_xpu_graph_handler_uses_xpu_graph(self):
-        benchmarker = Benchmarker()
-        benchmarker.benchmark_gpu = benchmark_gpu = Mock(return_value=6.0)
-        callable_ = Mock()
-        xpu = Mock()
-        stream = Mock()
-        graph = Mock()
-        tensor = Mock()
-        xpu.Stream.return_value = stream
-        xpu.XPUGraph.return_value = graph
-        xpu.stream.return_value = contextlib.nullcontext()
-        xpu.graph.return_value = contextlib.nullcontext()
+    def test_has_graph_benchmarker(self):
+        from torch._inductor.runtime import benchmarking as _bench
 
-        with patch.object(torch, "xpu", xpu):
-            result = benchmarker.benchmark_gpu_with_graph(
-                callable_,
-                device="xpu",
-                grad_to_none=[tensor],
-                warmup=2,
-                rep=4,
-            )
+        original = dict(_bench._GRAPH_BENCHMARK_DISPATCH)
+        try:
+            _bench._GRAPH_BENCHMARK_DISPATCH.clear()
+            self.assertFalse(_bench.has_graph_benchmarker("xpu"))
+            _bench.register_graph_benchmarker("cpu", lambda *args, **kwargs: 1.0)
+            self.assertTrue(_bench.has_graph_benchmarker(torch.device("cpu")))
+        finally:
+            _bench._GRAPH_BENCHMARK_DISPATCH.clear()
+            _bench._GRAPH_BENCHMARK_DISPATCH.update(original)
+
+    def test_unregistered_graph_device_uses_regular_benchmark(self):
+        from torch._inductor import autotune_process
+
+        class Request(autotune_process.BenchmarkRequest):
+            def make_run_fn(self, *args, out):
+                return lambda: None
+
+            def cleanup_run_fn(self):
+                pass
+
+            def do_bench(self, fn, *args, out=None):
+                return 6.0
+
+        request = Request("test", [], [], ())
+        request.benchmark_with_cudagraphs = True
+        input_tensor = torch.randn(2)
+        output_tensor = torch.randn(2)
+        with (
+            patch.object(
+                autotune_process.benchmarker,
+                "infer_device",
+                return_value=torch.device("xpu"),
+            ),
+            patch.object(
+                autotune_process.benchmarker,
+                "benchmark_gpu_with_graph",
+            ) as graph_benchmark,
+            patch.object(
+                autotune_process,
+                "has_graph_benchmarker",
+                return_value=False,
+            ),
+        ):
+            result = request.benchmark(input_tensor, out=output_tensor)
 
         self.assertEqual(result, 6.0)
-        self.assertGreaterEqual(callable_.call_count, 3)
-        self.assertGreaterEqual(xpu.synchronize.call_count, 2)
-        xpu.graph.assert_called_once_with(graph, stream=stream)
-        benchmark_gpu.assert_called_once_with(
-            graph.replay,
-            device_type="xpu",
-            warmup=2,
-            rep=4,
-        )
-        self.assertIsNone(tensor.grad)
+        graph_benchmark.assert_not_called()
 
     def test_benchmark_request_propagates_inferred_graph_device(self):
         from torch._inductor import autotune_process
@@ -338,8 +355,11 @@ class TestBenchmarker(TestCase):
         output_tensor = torch.randn(2)
         with (
             patch.object(
-                autotune_process.benchmarker, "infer_device", return_value="xpu"
+                autotune_process.benchmarker,
+                "infer_device",
+                return_value=torch.device("privateuseone"),
             ) as infer,
+            patch.object(autotune_process, "has_graph_benchmarker", return_value=True),
             patch.object(
                 autotune_process.benchmarker,
                 "benchmark_gpu_with_graph",
@@ -348,7 +368,9 @@ class TestBenchmarker(TestCase):
         ):
             self.assertEqual(request.benchmark(input_tensor, out=output_tensor), 1.0)
         infer.assert_called_once_with(input_tensor, output_tensor)
-        self.assertEqual(benchmark.call_args.kwargs["device"], "xpu")
+        self.assertEqual(
+            benchmark.call_args.kwargs["device"], torch.device("privateuseone")
+        )
 
     def test_extern_kernel_request_propagates_inferred_graph_device(self):
         from torch._inductor import autotune_process
@@ -361,8 +383,11 @@ class TestBenchmarker(TestCase):
         output_tensor = torch.empty(2)
         with (
             patch.object(
-                autotune_process.benchmarker, "infer_device", return_value="xpu"
+                autotune_process.benchmarker,
+                "infer_device",
+                return_value=torch.device("privateuseone"),
             ) as infer,
+            patch.object(autotune_process, "has_graph_benchmarker", return_value=True),
             patch.object(
                 autotune_process.benchmarker,
                 "benchmark_gpu_with_graph",
@@ -373,7 +398,9 @@ class TestBenchmarker(TestCase):
         self.assertEqual(infer.call_count, 1)
         self.assertIs(infer.call_args.args[0], input_tensor)
         self.assertIs(infer.call_args.args[1], input_tensor)
-        self.assertEqual(benchmark.call_args.kwargs["device"], "xpu")
+        self.assertEqual(
+            benchmark.call_args.kwargs["device"], torch.device("privateuseone")
+        )
 
     def test_nvgemm_request_propagates_inferred_graph_device(self):
         from torch._inductor.codegen.nv_universal_gemm import nv_universal_gemm
@@ -397,8 +424,11 @@ class TestBenchmarker(TestCase):
         request.cleanup_run_fn = lambda: None
         with (
             patch.object(
-                _bench.benchmarker, "infer_device", return_value="xpu"
+                _bench.benchmarker,
+                "infer_device",
+                return_value=torch.device("privateuseone"),
             ) as infer,
+            patch.object(_bench, "has_graph_benchmarker", return_value=True),
             patch.object(
                 _bench.benchmarker,
                 "benchmark_gpu_with_graph",
@@ -407,7 +437,9 @@ class TestBenchmarker(TestCase):
         ):
             self.assertEqual(request.benchmark(out=output_tensor), 3.0)
         infer.assert_called_once_with(input_tensor, output_tensor)
-        self.assertEqual(benchmark.call_args.kwargs["device"], "xpu")
+        self.assertEqual(
+            benchmark.call_args.kwargs["device"], torch.device("privateuseone")
+        )
 
     def test_subgraph_choice_caller_propagates_inferred_graph_device(self):
         from torch._inductor.codegen import subgraph
@@ -424,8 +456,11 @@ class TestBenchmarker(TestCase):
         output_tensor = torch.empty(2)
         with (
             patch.object(
-                subgraph.benchmarker, "infer_device", return_value="xpu"
+                subgraph.benchmarker,
+                "infer_device",
+                return_value=torch.device("privateuseone"),
             ) as infer,
+            patch.object(subgraph, "has_graph_benchmarker", return_value=True),
             patch.object(
                 subgraph.benchmarker,
                 "benchmark_gpu_with_graph",
@@ -434,7 +469,9 @@ class TestBenchmarker(TestCase):
         ):
             self.assertEqual(request.benchmark(arg, out=output_tensor), 4.0)
         infer.assert_called_once_with(sym_input, arg, output_tensor)
-        self.assertEqual(benchmark.call_args.kwargs["device"], "xpu")
+        self.assertEqual(
+            benchmark.call_args.kwargs["device"], torch.device("privateuseone")
+        )
 
     def test_choice_caller_propagates_inferred_graph_device(self):
         from torch._inductor import ir
@@ -445,7 +482,12 @@ class TestBenchmarker(TestCase):
         input_tensor = torch.randn(2)
         output_tensor = torch.empty(2)
         with (
-            patch.object(ir.benchmarker, "infer_device", return_value="xpu") as infer,
+            patch.object(
+                ir.benchmarker,
+                "infer_device",
+                return_value=torch.device("privateuseone"),
+            ) as infer,
+            patch.object(ir, "has_graph_benchmarker", return_value=True),
             patch.object(
                 ir.benchmarker,
                 "benchmark_gpu_with_graph",
@@ -454,7 +496,9 @@ class TestBenchmarker(TestCase):
         ):
             self.assertEqual(request.benchmark(input_tensor, out=output_tensor), 5.0)
         infer.assert_called_once_with(input_tensor, output_tensor)
-        self.assertEqual(benchmark.call_args.kwargs["device"], "xpu")
+        self.assertEqual(
+            benchmark.call_args.kwargs["device"], torch.device("privateuseone")
+        )
 
         from torch._inductor.runtime import benchmarking as _bench
 
